@@ -1,0 +1,174 @@
+name: Issue and PR Duplicate Detection Bot
+
+on:
+  issues:
+    types: [opened]
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  duplicate-check:
+    name: Check for Duplicates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Detect duplicates and triage
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const DUPLICATE_LABEL   = 'duplicate';
+            const TRIAGE_LABEL      = 'needs-triage';
+            // Minimum fraction of shared keywords to consider two items duplicates.
+            const SIMILARITY_THRESHOLD = 0.3;
+            // Stop words that carry no semantic meaning for matching.
+            const STOP_WORDS = new Set([
+              'a','an','the','and','or','but','in','on','at','to','for','of',
+              'with','is','are','was','were','be','been','being','have','has',
+              'had','do','does','did','will','would','could','should','may',
+              'might','shall','can','not','no','this','that','it','its',
+              'i','we','you','he','she','they','my','your','our','their',
+              'how','what','when','where','why','which','who','whom',
+            ]);
+
+            const isPR = !!context.payload.pull_request;
+            const item = isPR ? context.payload.pull_request : context.payload.issue;
+            const itemNumber = item.number;
+            const itemTitle  = (item.title  || '').toLowerCase();
+            const itemBody   = (item.body   || '').toLowerCase();
+            const itemText   = `${itemTitle} ${itemBody}`;
+
+            // ── helpers ──────────────────────────────────────────────────────
+            function tokenize(text) {
+              return new Set(
+                text
+                  .replace(/[^a-z0-9\s]/g, ' ')
+                  .split(/\s+/)
+                  .filter(w => w.length > 2 && !STOP_WORDS.has(w))
+              );
+            }
+
+            function jaccardSimilarity(setA, setB) {
+              // Two empty token sets share no meaningful keywords — treat as dissimilar
+              // so that blank issues are not flagged as duplicates of each other.
+              if (setA.size === 0 || setB.size === 0) return 0;
+              const intersection = [...setA].filter(w => setB.has(w)).length;
+              const union = new Set([...setA, ...setB]).size;
+              return intersection / union;
+            }
+
+            // ── ensure required labels exist ─────────────────────────────────
+            async function ensureLabel(name, color, description) {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo:  context.repo.repo,
+                  name,
+                });
+              } catch (err) {
+                if (err.status === 404) {
+                  await github.rest.issues.createLabel({
+                    owner: context.repo.owner,
+                    repo:  context.repo.repo,
+                    name,
+                    color,
+                    description,
+                  });
+                } else {
+                  throw err;
+                }
+              }
+            }
+
+            await ensureLabel(DUPLICATE_LABEL, 'cfd3d7', 'This issue or PR is a duplicate of another');
+            await ensureLabel(TRIAGE_LABEL,    'e4e669', 'Needs triage by a maintainer');
+
+            // ── fetch existing open issues (excluding the current one) ───────
+            const existingItems = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner:    context.repo.owner,
+                repo:     context.repo.repo,
+                state:    'open',
+                per_page: 100,
+              }
+            );
+
+            const candidates = existingItems.filter(i => i.number !== itemNumber);
+
+            // ── compare against each candidate ───────────────────────────────
+            const newTokens = tokenize(itemText);
+            let bestMatch   = null;
+            let bestScore   = 0;
+
+            for (const candidate of candidates) {
+              const candidateText = `${(candidate.title || '').toLowerCase()} ${(candidate.body || '').toLowerCase()}`;
+              const candidateTokens = tokenize(candidateText);
+              const score = jaccardSimilarity(newTokens, candidateTokens);
+
+              if (score > bestScore) {
+                bestScore = score;
+                bestMatch = candidate;
+              }
+            }
+
+            const isDuplicate = bestScore >= SIMILARITY_THRESHOLD;
+            const itemType    = isPR ? 'Pull Request' : 'Issue';
+
+            // ── act on result ────────────────────────────────────────────────
+            if (isDuplicate) {
+              core.info(`Duplicate detected: #${bestMatch.number} (score ${bestScore.toFixed(3)})`);
+
+              // Add 'duplicate' label
+              await github.rest.issues.addLabels({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: itemNumber,
+                labels:       [DUPLICATE_LABEL],
+              });
+
+              // Post duplicate comment
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: itemNumber,
+                body: [
+                  `⚠️ This looks like a duplicate of #${bestMatch.number}.`,
+                  '',
+                  `Please check that ${bestMatch.pull_request ? 'PR' : 'issue'} for updates and continue the discussion there.`,
+                  'If you believe this is **not** a duplicate, please leave a comment explaining the difference and a maintainer will re-triage.',
+                ].join('\n'),
+              });
+
+            } else {
+              core.info(`No duplicate found (best score ${bestScore.toFixed(3)})`);
+
+              // Add 'needs-triage' label
+              await github.rest.issues.addLabels({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: itemNumber,
+                labels:       [TRIAGE_LABEL],
+              });
+
+              // Post welcome / acknowledgement comment
+              const welcomeLines = [
+                `👋 Thanks for opening this ${itemType}!`,
+                '',
+                'A maintainer will review it shortly. In the meantime:',
+                '',
+                '- Please make sure your description is as detailed as possible.',
+                '- Search existing issues at https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/issues to avoid duplicates.',
+                '- Follow the contribution guidelines if they apply.',
+              ];
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: itemNumber,
+                body:         welcomeLines.join('\n'),
+              });
+            }
